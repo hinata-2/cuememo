@@ -44,6 +44,9 @@ const projectExportInfoBtn = document.getElementById("projectExportInfoBtn");
 const exportMemosBtn = document.getElementById("exportMemosBtn");
 
 const storageKey = "cuememo-web-projects-v1";
+const dbName = "cuememo-web-db";
+const dbVersion = 1;
+const dbStoreName = "keyval";
 
 let captureTime = null;
 let memos = [];
@@ -69,13 +72,71 @@ let recordingStream = null;
 let memoComposition = false;
 let noteComposition = false;
 let projectNameComposition = false;
+let dbPromise = null;
 
-function loadProjects() {
+function openProjectsDb() {
+  if (dbPromise) return dbPromise;
+
+  dbPromise = new Promise((resolve, reject) => {
+    const request = indexedDB.open(dbName, dbVersion);
+
+    request.onupgradeneeded = () => {
+      const db = request.result;
+      if (!db.objectStoreNames.contains(dbStoreName)) {
+        db.createObjectStore(dbStoreName);
+      }
+    };
+
+    request.onsuccess = () => resolve(request.result);
+    request.onerror = () => reject(request.error || new Error("Failed to open IndexedDB"));
+  });
+
+  return dbPromise;
+}
+
+async function readStoredValue(key) {
+  const db = await openProjectsDb();
+  return new Promise((resolve, reject) => {
+    const tx = db.transaction(dbStoreName, "readonly");
+    const store = tx.objectStore(dbStoreName);
+    const request = store.get(key);
+    request.onsuccess = () => resolve(request.result);
+    request.onerror = () => reject(request.error || new Error("Failed to read IndexedDB value"));
+  });
+}
+
+async function writeStoredValue(key, value) {
+  const db = await openProjectsDb();
+  return new Promise((resolve, reject) => {
+    const tx = db.transaction(dbStoreName, "readwrite");
+    const store = tx.objectStore(dbStoreName);
+    const request = store.put(value, key);
+    request.onsuccess = () => resolve();
+    request.onerror = () => reject(request.error || new Error("Failed to write IndexedDB value"));
+  });
+}
+
+function notifyStorageError(error) {
+  console.error("Failed to persist projects:", error);
+  alert("音声データの保存に失敗しました。ブラウザの保存容量やプライベートモード設定を確認してください。");
+}
+
+async function loadProjects() {
   try {
-    const raw = localStorage.getItem(storageKey);
-    allProjectsData = raw ? JSON.parse(raw) : {};
+    const stored = await readStoredValue(storageKey);
+    allProjectsData = stored && typeof stored === "object" ? stored : {};
     if (!allProjectsData || typeof allProjectsData !== "object") {
       allProjectsData = {};
+    }
+
+    const legacyRaw = localStorage.getItem(storageKey);
+    if (legacyRaw && Object.keys(allProjectsData).length === 0) {
+      const legacyData = JSON.parse(legacyRaw);
+      if (legacyData && typeof legacyData === "object") {
+        allProjectsData = legacyData;
+        await writeStoredValue(storageKey, allProjectsData);
+        localStorage.removeItem(storageKey);
+      }
     }
   } catch (error) {
     console.error("Failed to load projects:", error);
@@ -83,8 +144,8 @@ function loadProjects() {
   }
 }
 
-function saveProjects() {
-  localStorage.setItem(storageKey, JSON.stringify(allProjectsData));
+async function saveProjects() {
+  await writeStoredValue(storageKey, allProjectsData);
 }
 
 function setRecordingStatus(message) {
@@ -97,9 +158,9 @@ function updateVolumeUI() {
   if (volumeValue) volumeValue.textContent = `${percent}%`;
 }
 
-function persistProjects() {
-  saveCurrentProjectData();
-  saveProjects();
+async function persistProjects() {
+  await saveCurrentProjectData();
+  await saveProjects();
 }
 
 function getProjectAudioBase64(project) {
@@ -235,13 +296,18 @@ function exportMemosAsText() {
   });
 }
 
-function exportCurrentProject() {
+async function exportCurrentProject() {
   if (!currentProjectName || !allProjectsData[currentProjectName]) {
     alert("書き出すプロジェクトがありません。");
     return;
   }
 
-  persistProjects();
+  try {
+    await persistProjects();
+  } catch (error) {
+    notifyStorageError(error);
+    return;
+  }
 
   const project = allProjectsData[currentProjectName];
   const payload = {
@@ -296,7 +362,7 @@ async function importProjectFile(file) {
       createdAt: importedProject.createdAt || new Date().toISOString()
     };
 
-    saveProjects();
+    await saveProjects();
     hideInfoPopup();
     renderFileList();
     await openProject(projectName);
@@ -319,8 +385,8 @@ async function setAudioSource(file) {
     project.audioDataUrl = dataUrl;
     project.isRecorded = file.name.startsWith("recording-");
     allProjectsData[currentProjectName] = project;
-    saveCurrentProjectData();
-    saveProjects();
+    await saveCurrentProjectData();
+    await saveProjects();
   } else {
     pendingAudioFile = file;
     pendingAudioDataUrl = await fileToDataUrl(file);
@@ -351,14 +417,14 @@ function updateCurrentProjectMemos() {
   renderMemos();
 }
 
-function saveCurrentProjectData() {
+async function saveCurrentProjectData() {
   if (!currentProjectName) return;
   const project = allProjectsData[currentProjectName] || {};
   project.memos = memos;
   project.notes = notes;
   project.audioFileName = currentAudioFileName;
   allProjectsData[currentProjectName] = project;
-  saveProjects();
+  await saveProjects();
 }
 
 async function decodeWaveform(file) {
@@ -612,13 +678,13 @@ function addNote() {
   if (!text) return;
   notes.push({ text, createdAt: new Date().toISOString() });
   noteInput.value = "";
-  saveCurrentProjectData();
+  saveCurrentProjectData().catch(notifyStorageError);
   renderNotes();
 }
 
 function removeNote(index) {
   notes.splice(index, 1);
-  saveCurrentProjectData();
+  saveCurrentProjectData().catch(notifyStorageError);
   renderNotes();
 }
 
@@ -637,7 +703,7 @@ function saveInlineEdit() {
   if (!newText) return;
   memos[editingMemoIndex] = { ...memos[editingMemoIndex], text: newText, color: editingMemoColor };
   editingMemoIndex = null;
-  saveCurrentProjectData();
+  saveCurrentProjectData().catch(notifyStorageError);
   renderMemos();
   drawWaveform();
 }
@@ -649,7 +715,7 @@ function cancelInlineEdit() {
 
 function removeMemo(index) {
   memos.splice(index, 1);
-  saveCurrentProjectData();
+  saveCurrentProjectData().catch(notifyStorageError);
   renderMemos();
   drawWaveform();
 }
@@ -661,7 +727,7 @@ function addMemo() {
   memos.push({ time: captureTime, text, color: "red" });
   memoInput.value = "";
   captureTime = null;
-  saveCurrentProjectData();
+  saveCurrentProjectData().catch(notifyStorageError);
   renderMemos();
 }
 
@@ -794,7 +860,12 @@ async function createProject() {
     isRecorded: Boolean(pendingAudioFile.name.startsWith("recording-")),
     createdAt: new Date().toISOString()
   };
-  saveProjects();
+  try {
+    await saveProjects();
+  } catch (error) {
+    notifyStorageError(error);
+    return;
+  }
   addToRecentFiles(projectName);
 
   if (currentAudioUrl) URL.revokeObjectURL(currentAudioUrl);
@@ -843,8 +914,8 @@ async function startRecording(mode = "new-project") {
           project.audioDataUrl = dataUrl;
           project.isRecorded = true;
           allProjectsData[currentProjectName] = project;
-          saveCurrentProjectData();
-          saveProjects();
+          await saveCurrentProjectData();
+          await saveProjects();
           await setAudioSource(recordedFile);
         } else {
           pendingAudioFile = recordedFile;
@@ -1026,8 +1097,8 @@ window.addEventListener("keydown", (event) => {
   }
 });
 
-function init() {
-  loadProjects();
+async function init() {
+  await loadProjects();
   player.volume = 1;
   updateVolumeUI();
   setRecordingStatus("ブラウザ内に保存します。");
@@ -1035,4 +1106,6 @@ function init() {
   renderFileList();
 }
 
-init();
+init().catch((error) => {
+  console.error("Failed to initialize app:", error);
+});
